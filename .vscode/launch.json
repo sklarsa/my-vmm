@@ -1,0 +1,20 @@
+{
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "run my-vmm",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/target/debug/my-vmm",
+            "env": {
+                "RUST_BACKTRACE": "short",
+                "RUSTC_TOOLCHAIN": "/home/steven/.rustup/toolchains/nightly-2025-09-24-x86_64-unknown-linux-gnu"
+            },
+            "args": [],
+            "sourceMap": {},
+            "sourceLanguages": [
+                "rust"
+            ]
+        }
+    ]
+}
