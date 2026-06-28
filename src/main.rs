@@ -1,78 +1,263 @@
+use kvm_bindings::kvm_segment;
 use kvm_bindings::kvm_userspace_memory_region;
-use kvm_ioctls::{Kvm, VcpuExit};
+use kvm_ioctls::Kvm;
+use kvm_ioctls::VcpuExit;
+use linux_loader::cmdline::Cmdline;
+use linux_loader::configurator::linux::LinuxBootConfigurator;
+use linux_loader::configurator::{BootConfigurator, BootParams};
+use linux_loader::loader::bootparam::boot_params;
+use linux_loader::loader::elf::Elf;
+use linux_loader::loader::{KernelLoader, load_cmdline};
+use std::fs::File;
+use std::io::{self};
+use std::sync::{Arc, Mutex};
+use vm_memory::Bytes;
+use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
+use vm_superio::Trigger;
+use vm_superio::serial::Serial;
+use vmm_sys_util::eventfd::EventFd;
 
-fn main() {
-    let mem_size = 0xf000;
-    let guest_addr: u64 = 0x1000;
+const MEM_SIZE: usize = 512 << 20; // 512 MiB
+const HIMEM_START: u64 = 0x10_0000; // 1 MiB — where the 64-bit kernel goes
+const CMDLINE_START: u64 = 0x2_0000;
 
-    // Real-mode machine code: compute 2+3, turn it into ASCII, write it to
-    // port 0x3f8 (COM1), write a newline, then halt.
-    let code: &[u8] = &[
-        0xba, 0xf8, 0x03, // mov  dx, 0x3f8
-        0x00, 0xd8, // add  al, bl
-        0x04, b'0', // add  al, '0'
-        0xee, // out  dx, al
-        0xb0, b'\n', // mov  al, '\n'
-        0xee,  // out  dx, al
-        0xf4,  // hlt
-    ];
+const ZERO_PAGE_START: u64 = 0x7000;
 
-    let kvm = Kvm::new().unwrap();
-    let vm = kvm.create_vm().unwrap();
+// e820 entry types and the boot protocol magic numbers.
+const KERNEL_BOOT_FLAG_MAGIC: u16 = 0xaa55;
+const KERNEL_HDR_MAGIC: u32 = 0x5372_6448; // "HdrS"
+const KERNEL_LOADER_OTHER: u8 = 0xff;
+const E820_RAM: u32 = 1;
+const EBDA_START: u64 = 0x9_fc00; // top of usable low memory
+const HIMEM_START_ADDR: u64 = 0x10_0000; // 1 MiB
 
-    let host_mem = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            mem_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_NORESERVE,
-            -1,
-            0,
-        ) as *mut u8
-    };
+const BOOT_GDT_OFFSET: u64 = 0x500;
+const PML4_START: u64 = 0x9000;
+const PDPTE_START: u64 = 0xa000;
+const PDE_START: u64 = 0xb000;
 
-    // Tell KVM: "this host memory IS guest physical memory starting at guest_addr."
-    let region = kvm_userspace_memory_region {
-        slot: 0,
-        guest_phys_addr: guest_addr,
-        memory_size: mem_size as u64,
-        userspace_addr: host_mem as u64,
-        flags: 0,
-    };
-    unsafe {
-        vm.set_user_memory_region(region).unwrap();
+const X86_CR0_PE: u64 = 0x1;
+const X86_CR0_PG: u64 = 0x8000_0000;
+const X86_CR4_PAE: u64 = 0x20;
+const EFER_LME: u64 = 0x100;
+const EFER_LMA: u64 = 0x400;
+
+const COM1_BASE: u16 = 0x3f8;
+
+fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32) {
+    let idx = params.e820_entries as usize;
+    params.e820_table[idx].addr = addr;
+    params.e820_table[idx].size = size;
+    params.e820_table[idx].r#type = mem_type;
+    params.e820_entries += 1;
+}
+
+fn gdt_entry(flags: u16, base: u32, limit: u32) -> u64 {
+    ((u64::from(base) & 0xff00_0000) << 32)
+        | ((u64::from(flags) & 0x0000_f0ff) << 40)
+        | ((u64::from(limit) & 0x000f_0000) << 32)
+        | ((u64::from(base) & 0x00ff_ffff) << 16)
+        | (u64::from(limit) & 0x0000_ffff)
+}
+
+// Helper: turn a GDT entry into the kvm_segment KVM wants.
+fn seg_from_gdt(entry: u64, table_index: u8) -> kvm_segment {
+    let base = (((entry >> 16) & 0xffffff) | ((entry >> 32) & 0xff00_0000)) as u64;
+    let limit = (((entry) & 0xffff) | ((entry >> 32) & 0xf_0000)) as u32;
+    let flags = ((entry >> 40) & 0xf0ff) as u16;
+    kvm_segment {
+        base,
+        limit,
+        selector: (table_index as u16) * 8,
+        type_: (flags & 0xf) as u8,
+        present: ((flags >> 7) & 1) as u8,
+        dpl: ((flags >> 5) & 3) as u8,
+        db: ((flags >> 14) & 1) as u8,
+        s: ((flags >> 4) & 1) as u8,
+        l: ((flags >> 13) & 1) as u8,
+        g: ((flags >> 15) & 1) as u8,
+        avl: ((flags >> 12) & 1) as u8,
+        ..Default::default()
+    }
+}
+
+fn setup_long_mode(vcpu: &kvm_ioctls::VcpuFd, guest_mem: &GuestMemoryMmap, entry: u64) {
+    // --- minimal identity-mapped page tables ---
+    // PML4[0] -> PDPTE,  PDPTE[0] -> PDE,  PDE entries -> 2 MiB pages.
+    guest_mem
+        .write_obj(PDPTE_START | 0x03, GuestAddress(PML4_START))
+        .unwrap();
+    guest_mem
+        .write_obj(PDE_START | 0x03, GuestAddress(PDPTE_START))
+        .unwrap();
+    for i in 0..512u64 {
+        // 0x83 = present | writable | huge-page(2 MiB)
+        guest_mem
+            .write_obj((i << 21) | 0x83, GuestAddress(PDE_START + i * 8))
+            .unwrap();
     }
 
-    // Copy our code into the start of that region (= guest phys 0x1000).
-    unsafe {
-        std::slice::from_raw_parts_mut(host_mem, mem_size)[..code.len()].copy_from_slice(code);
-    }
-    let mut vcpu = vm.create_vcpu(0).unwrap();
-
-    // Real mode, code segment based at 0, instruction pointer at our code.
     let mut sregs = vcpu.get_sregs().unwrap();
-    sregs.cs.base = 0;
-    sregs.cs.selector = 0;
+
+    // --- GDT: null, code, data ---
+    let gdt = [
+        gdt_entry(0, 0, 0),            // null
+        gdt_entry(0xa09b, 0, 0xfffff), // code: present, exec, 64-bit (L bit)
+        gdt_entry(0xc093, 0, 0xfffff), // data: present, writable
+    ];
+    for (i, entry) in gdt.iter().enumerate() {
+        guest_mem
+            .write_obj(*entry, GuestAddress(BOOT_GDT_OFFSET + (i as u64) * 8))
+            .unwrap();
+    }
+    sregs.gdt.base = BOOT_GDT_OFFSET;
+    sregs.gdt.limit = (gdt.len() * 8 - 1) as u16;
+
+    let code_seg = seg_from_gdt(gdt[1], 1);
+    let data_seg = seg_from_gdt(gdt[2], 2);
+    sregs.cs = code_seg;
+    sregs.ds = data_seg;
+    sregs.es = data_seg;
+    sregs.fs = data_seg;
+    sregs.gs = data_seg;
+    sregs.ss = data_seg;
+
+    // --- the actual mode switch ---
+    sregs.cr3 = PML4_START;
+    sregs.cr4 |= X86_CR4_PAE;
+    sregs.cr0 |= X86_CR0_PE | X86_CR0_PG;
+    sregs.efer |= EFER_LME | EFER_LMA;
+
     vcpu.set_sregs(&sregs).unwrap();
 
+    // --- general registers: entry point + boot_params pointer ---
     let mut regs = vcpu.get_regs().unwrap();
-    regs.rip = guest_addr; // start executing at 0x1000
-    regs.rax = 2;
-    regs.rbx = 3;
-    regs.rflags = 2; // bit 1 is reserved-and-always-set; KVM rejects 0
+    regs.rflags = 0x2;
+    regs.rip = entry;
+    regs.rsi = 0x7000; // ZERO_PAGE_START — kernel reads boot_params from rsi
+    regs.rsp = 0x8ff0;
     vcpu.set_regs(&regs).unwrap();
+}
 
-    // The run / exit loop — the heart of every VMM.
+// vm-superio needs a Trigger; EventFd isn't one, so wrap it.
+struct EventFdTrigger(EventFd);
+impl Trigger for EventFdTrigger {
+    type E = io::Error;
+    fn trigger(&self) -> Result<(), Self::E> {
+        self.0.write(1)
+    }
+}
+
+fn main() {
+    let kvm = Kvm::new().unwrap();
+    let vm = kvm.create_vm().unwrap();
+    vm.create_irq_chip().unwrap();
+
+    // 1. Guest RAM as a vm-memory object.
+    let guest_mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x0), MEM_SIZE)]).unwrap();
+
+    // 2. Hand each region to KVM.
+    for (i, region) in guest_mem.iter().enumerate() {
+        let mr = kvm_userspace_memory_region {
+            slot: i as u32,
+            guest_phys_addr: region.start_addr().raw_value(),
+            memory_size: region.len() as u64,
+            userspace_addr: guest_mem.get_host_address(region.start_addr()).unwrap() as u64,
+            flags: 0,
+        };
+        unsafe { vm.set_user_memory_region(mr).unwrap() }
+    }
+
+    // 3. Load ELF kernel
+    let mut kernel = File::open("../linux/vmlinux").unwrap();
+    let load = Elf::load(
+        &guest_mem,
+        None,
+        &mut kernel,
+        Some(GuestAddress(HIMEM_START)),
+    )
+    .unwrap();
+    println!("kernel entry: {:#x}", load.kernel_load.raw_value());
+
+    // 4. Command line into guest memory.
+    let mut cmdline = Cmdline::new(0x10000).unwrap();
+    cmdline
+        .insert_str("console=ttyS0 reboot=k panic=1 pci=off")
+        .unwrap();
+    load_cmdline(&guest_mem, GuestAddress(CMDLINE_START), &cmdline).unwrap();
+
+    // Build boot params
+    let mut params = boot_params::default();
+    params.hdr.type_of_loader = KERNEL_LOADER_OTHER;
+    params.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC;
+    params.hdr.header = KERNEL_HDR_MAGIC;
+    params.hdr.cmd_line_ptr = CMDLINE_START as u32;
+    params.hdr.cmdline_size = cmdline.as_cstring().unwrap().as_bytes().len() as u32 + 1;
+
+    // Memory map: low RAM (below the BIOS/EBDA area), then RAM from 1 MiB up.
+    add_e820_entry(&mut params, 0, EBDA_START, E820_RAM);
+    add_e820_entry(
+        &mut params,
+        HIMEM_START_ADDR,
+        (MEM_SIZE as u64) - HIMEM_START_ADDR,
+        E820_RAM,
+    );
+
+    // Then write the constructed bootparams to guest memory
+    LinuxBootConfigurator::write_bootparams::<GuestMemoryMmap>(
+        &BootParams::new(&params, GuestAddress(ZERO_PAGE_START)),
+        &guest_mem,
+    )
+    .unwrap();
+
+    let mut vcpu = vm.create_vcpu(0).unwrap();
+
+    // CPUID — let the kernel's feature checks pass.
+    let kvm_cpuid = kvm
+        .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+        .unwrap();
+    vcpu.set_cpuid2(&kvm_cpuid).unwrap();
+
+    setup_long_mode(&vcpu, &guest_mem, load.kernel_load.raw_value());
+
+    // Create serial device and interrupt FD, then register with KVM on COM1 line (IRQ 4)
+    let com1_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+    vm.register_irqfd(&com1_evt, 4).unwrap();
+
+    let serial = Arc::new(Mutex::new(Serial::new(
+        EventFdTrigger(com1_evt.try_clone().unwrap()),
+        io::stdout(),
+    )));
+
+    // Finally, the kvm run loop
     loop {
         match vcpu.run().expect("vcpu run failed") {
-            VcpuExit::IoOut(port, data) => {
-                print!("[guest wrote to port {:#x}] {}", port, data[0] as char);
+            VcpuExit::IoOut(addr, data) => {
+                if (COM1_BASE..COM1_BASE + 8).contains(&addr) {
+                    serial
+                        .lock()
+                        .unwrap()
+                        .write((addr - COM1_BASE) as u8, data[0])
+                        .unwrap();
+                }
+            }
+            VcpuExit::IoIn(addr, data) => {
+                if (COM1_BASE..COM1_BASE + 8).contains(&addr) {
+                    data[0] = serial.lock().unwrap().read((addr - COM1_BASE) as u8);
+                }
             }
             VcpuExit::Hlt => {
-                println!("\nguest halted - done.");
+                println!("\nguest halted");
                 break;
             }
-            other => panic!("unexpected VM exit: {:?}", other),
+            VcpuExit::Shutdown => {
+                println!("\nguest shutdown");
+                break;
+            }
+            other => {
+                println!("unhandled exit: {:?}", other);
+                // don't panic — log and keep going so you can see how far it got
+            }
         }
     }
 }
