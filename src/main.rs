@@ -9,8 +9,10 @@ use linux_loader::loader::bootparam::boot_params;
 use linux_loader::loader::elf::Elf;
 use linux_loader::loader::{KernelLoader, load_cmdline};
 use std::fs::File;
-use std::io::{self};
+use std::io::{self, Read};
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use vm_memory::Bytes;
 use vm_memory::{Address, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 use vm_superio::Trigger;
@@ -148,7 +150,42 @@ impl Trigger for EventFdTrigger {
     }
 }
 
+fn set_raw_mode() -> libc::termios {
+    let fd = io::stdin().as_raw_fd();
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(fd, &mut termios);
+        let original = termios; // copy the pristine settings before we mangle them
+        libc::cfmakeraw(&mut termios);
+        libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        original // return them to the caller
+    }
+}
+
+fn restore_mode(original: &libc::termios) {
+    let fd = io::stdin().as_raw_fd();
+    unsafe {
+        libc::tcsetattr(fd, libc::TCSANOW, original);
+    }
+}
+
+struct RawMode(libc::termios);
+
+impl RawMode {
+    fn new() -> Self {
+        RawMode(set_raw_mode())
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        restore_mode(&self.0)
+    }
+}
+
 fn main() {
+    let _raw = RawMode::new();
+
     let kvm = Kvm::new().unwrap();
     let vm = kvm.create_vm().unwrap();
     vm.create_irq_chip().unwrap();
@@ -169,7 +206,7 @@ fn main() {
     }
 
     // 3. Load ELF kernel
-    let mut kernel = File::open("../linux/vmlinux").unwrap();
+    let mut kernel = File::open("./resources/vmlinux_7.0").unwrap();
     let load = Elf::load(
         &guest_mem,
         None,
@@ -179,10 +216,25 @@ fn main() {
     .unwrap();
     println!("kernel entry: {:#x}", load.kernel_load.raw_value());
 
+    // Load initramfs and place it in guest memory
+    let mut initrd = Vec::new();
+    File::open("resources/initramfs.cpio.gz")
+        .unwrap()
+        .read_to_end(&mut initrd)
+        .unwrap();
+    let initrd_size = initrd.len();
+
+    let initrd_addr = (MEM_SIZE - initrd_size) & !0xfff_usize; // round down to 4 KiB
+    guest_mem
+        .write_slice(&initrd, GuestAddress(initrd_addr as u64))
+        .unwrap();
+
+    println!("initramfs: {} bytes at {:#x}", initrd_size, initrd_addr);
+
     // 4. Command line into guest memory.
     let mut cmdline = Cmdline::new(0x10000).unwrap();
     cmdline
-        .insert_str("console=ttyS0 reboot=k panic=1 pci=off")
+        .insert_str("console=ttyS0 reboot=k panic=1 rdinit=/init")
         .unwrap();
     load_cmdline(&guest_mem, GuestAddress(CMDLINE_START), &cmdline).unwrap();
 
@@ -193,6 +245,8 @@ fn main() {
     params.hdr.header = KERNEL_HDR_MAGIC;
     params.hdr.cmd_line_ptr = CMDLINE_START as u32;
     params.hdr.cmdline_size = cmdline.as_cstring().unwrap().as_bytes().len() as u32 + 1;
+    params.hdr.ramdisk_image = initrd_addr as u32;
+    params.hdr.ramdisk_size = initrd_size as u32;
 
     // Memory map: low RAM (below the BIOS/EBDA area), then RAM from 1 MiB up.
     add_e820_entry(&mut params, 0, EBDA_START, E820_RAM);
@@ -228,6 +282,21 @@ fn main() {
         EventFdTrigger(com1_evt.try_clone().unwrap()),
         io::stdout(),
     )));
+
+    // Input handling
+    let serial_input = Arc::clone(&serial);
+    thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        loop {
+            if io::stdin().read(&mut buf).unwrap() == 1 {
+                serial_input
+                    .lock()
+                    .unwrap()
+                    .enqueue_raw_bytes(&buf)
+                    .unwrap();
+            }
+        }
+    });
 
     // Finally, the kvm run loop
     loop {
