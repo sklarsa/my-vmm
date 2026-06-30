@@ -47,6 +47,40 @@ const EFER_LMA: u64 = 0x400;
 
 const COM1_BASE: u16 = 0x3f8;
 
+// virtio-mmio register offsets (modern transport, version 2)
+const VIRTIO_MMIO_MAGIC_VALUE: u64 = 0x000;
+const VIRTIO_MMIO_VERSION: u64 = 0x004;
+const VIRTIO_MMIO_DEVICE_ID: u64 = 0x008;
+const VIRTIO_MMIO_VENDOR_ID: u64 = 0x00c;
+const VIRTIO_MMIO_DEVICE_FEATURES: u64 = 0x010;
+const VIRTIO_MMIO_DEVICE_FEATURES_SEL: u64 = 0x014;
+const VIRTIO_MMIO_DRIVER_FEATURES: u64 = 0x020;
+const VIRTIO_MMIO_DRIVER_FEATURES_SEL: u64 = 0x024;
+const VIRTIO_MMIO_QUEUE_SEL: u64 = 0x030;
+const VIRTIO_MMIO_QUEUE_NUM_MAX: u64 = 0x034;
+const VIRTIO_MMIO_QUEUE_NUM: u64 = 0x038;
+const VIRTIO_MMIO_QUEUE_READY: u64 = 0x044;
+const VIRTIO_MMIO_QUEUE_NOTIFY: u64 = 0x050;
+const VIRTIO_MMIO_INTERRUPT_STATUS: u64 = 0x060;
+const VIRTIO_MMIO_INTERRUPT_ACK: u64 = 0x064;
+const VIRTIO_MMIO_STATUS: u64 = 0x070;
+const VIRTIO_MMIO_QUEUE_DESC_LOW: u64 = 0x080;
+const VIRTIO_MMIO_QUEUE_DESC_HIGH: u64 = 0x084;
+const VIRTIO_MMIO_QUEUE_AVAIL_LOW: u64 = 0x090;
+const VIRTIO_MMIO_QUEUE_AVAIL_HIGH: u64 = 0x094;
+const VIRTIO_MMIO_QUEUE_USED_LOW: u64 = 0x0a0;
+const VIRTIO_MMIO_QUEUE_USED_HIGH: u64 = 0x0a4;
+const VIRTIO_MMIO_CONFIG: u64 = 0x100;
+
+const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt" little-endian
+const VIRTIO_VERSION: u32 = 2; // modern (non-legacy) virtio 1.x
+const VIRTIO_ID_BLOCK: u32 = 2; // device type 2 = block
+const QUEUE_SIZE_MAX: u32 = 256;
+const VIRTIO_F_VERSION_1: u64 = 1 << 32; // mandatory modern feature bit
+
+const VIRTIO_BLK_BASE: u64 = 0xd000_0000;
+const VIRTIO_BLK_LEN: u64 = 0x1000;
+
 #[derive(Parser)]
 struct Args {
     #[arg(long)]
@@ -57,6 +91,8 @@ struct Args {
     cmdline: String,
     #[arg(long)]
     initramfs: String,
+    #[arg(long)]
+    disk: String,
 }
 
 fn add_e820_entry(params: &mut boot_params, addr: u64, size: u64, mem_type: u32) {
@@ -193,6 +229,131 @@ impl Drop for RawMode {
     }
 }
 
+struct VirtioBlk {
+    disk: File,
+    capacity_sectors: u64, // disk size in 512-byte sectors (block config space)
+
+    // negotiation state
+    status: u32,
+    device_features_sel: u32,
+    driver_features_sel: u32,
+    driver_features: u64,
+
+    // the single virtqueue's configuration (the guest fills these in during init)
+    queue_sel: u32,
+    queue_num: u32,
+    queue_ready: u32,
+    queue_desc: u64,  // guest addr of descriptor table
+    queue_avail: u64, // guest addr of available ring
+    queue_used: u64,  // guest addr of used ring
+
+    // interrupt
+    interrupt_status: u32,
+    interrupt_evt: EventFd,
+}
+
+impl VirtioBlk {
+    fn new(disk: File, capacity_bytes: u64, interrupt_evt: EventFd) -> Self {
+        VirtioBlk {
+            disk,
+            capacity_sectors: capacity_bytes / 512,
+            status: 0,
+            device_features_sel: 0,
+            driver_features_sel: 0,
+            driver_features: 0,
+            queue_sel: 0,
+            queue_num: 0,
+            queue_ready: 0,
+            queue_desc: 0,
+            queue_avail: 0,
+            queue_used: 0,
+            interrupt_status: 0,
+            interrupt_evt,
+        }
+    }
+
+    fn device_features(&self) -> u64 {
+        VIRTIO_F_VERSION_1 // offer only the mandatory modern bit for now
+    }
+
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        let val: u32 = match offset {
+            VIRTIO_MMIO_MAGIC_VALUE => VIRTIO_MAGIC,
+            VIRTIO_MMIO_VERSION => VIRTIO_VERSION,
+            VIRTIO_MMIO_DEVICE_ID => VIRTIO_ID_BLOCK,
+            VIRTIO_MMIO_VENDOR_ID => 0x1234_5678, // arbitrary
+            VIRTIO_MMIO_DEVICE_FEATURES => {
+                if self.device_features_sel == 0 {
+                    self.device_features() as u32 // low word
+                } else {
+                    (self.device_features() >> 32) as u32 // high word (where VERSION_1 lives)
+                }
+            }
+            VIRTIO_MMIO_QUEUE_NUM_MAX => QUEUE_SIZE_MAX,
+            VIRTIO_MMIO_QUEUE_READY => self.queue_ready,
+            VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status,
+            VIRTIO_MMIO_STATUS => self.status,
+            // block config space: capacity (u64 sectors) at 0x100
+            VIRTIO_MMIO_CONFIG => self.capacity_sectors as u32,
+            0x104 => (self.capacity_sectors >> 32) as u32,
+            _ => 0,
+        };
+        let bytes = val.to_le_bytes();
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = bytes.get(i).copied().unwrap_or(0);
+        }
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        let mut b = [0u8; 4];
+        for (i, x) in data.iter().enumerate().take(4) {
+            b[i] = *x;
+        }
+        let val = u32::from_le_bytes(b);
+
+        match offset {
+            VIRTIO_MMIO_DEVICE_FEATURES_SEL => self.device_features_sel = val,
+            VIRTIO_MMIO_DRIVER_FEATURES_SEL => self.driver_features_sel = val,
+            VIRTIO_MMIO_DRIVER_FEATURES => {
+                if self.driver_features_sel == 0 {
+                    self.driver_features |= val as u64;
+                } else {
+                    self.driver_features |= (val as u64) << 32;
+                }
+            }
+            VIRTIO_MMIO_QUEUE_SEL => self.queue_sel = val,
+            VIRTIO_MMIO_QUEUE_NUM => self.queue_num = val,
+            VIRTIO_MMIO_QUEUE_READY => self.queue_ready = val,
+            VIRTIO_MMIO_QUEUE_DESC_LOW => {
+                self.queue_desc = (self.queue_desc & 0xffff_ffff_0000_0000) | val as u64
+            }
+            VIRTIO_MMIO_QUEUE_DESC_HIGH => {
+                self.queue_desc = (self.queue_desc & 0x0000_0000_ffff_ffff) | ((val as u64) << 32)
+            }
+            VIRTIO_MMIO_QUEUE_AVAIL_LOW => {
+                self.queue_avail = (self.queue_avail & 0xffff_ffff_0000_0000) | val as u64
+            }
+            VIRTIO_MMIO_QUEUE_AVAIL_HIGH => {
+                self.queue_avail = (self.queue_avail & 0x0000_0000_ffff_ffff) | ((val as u64) << 32)
+            }
+            VIRTIO_MMIO_QUEUE_USED_LOW => {
+                self.queue_used = (self.queue_used & 0xffff_ffff_0000_0000) | val as u64
+            }
+            VIRTIO_MMIO_QUEUE_USED_HIGH => {
+                self.queue_used = (self.queue_used & 0x0000_0000_ffff_ffff) | ((val as u64) << 32)
+            }
+            VIRTIO_MMIO_INTERRUPT_ACK => self.interrupt_status &= !val,
+            VIRTIO_MMIO_STATUS => self.status = val,
+            VIRTIO_MMIO_QUEUE_NOTIFY => {
+                // Stage 2: the "kick" — guest says queue `val` has work to do.
+                // For now, just observe it; discovery completes without servicing.
+                println!("[virtio-blk] kick on queue {}", val);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let mem_size = args.mem_mib << 20;
@@ -258,11 +419,30 @@ fn main() -> Result<()> {
 
     println!("initramfs: {} bytes at {:#x}", initrd_size, initrd_addr);
 
+    // Set up MMIO block device
+    let disk = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&args.disk)
+        .context("opening disk image")?;
+    let capacity_bytes = disk.metadata().context("statting disk")?.len();
+
+    let blk_evt = EventFd::new(libc::EFD_NONBLOCK).context("creating virtio-blk eventfd")?;
+    vm.register_irqfd(&blk_evt, 5)
+        .context("registering virtio-blk irq")?; // IRQ 5
+
+    let mut blk_dev = VirtioBlk::new(disk, capacity_bytes, blk_evt);
+
     // 4. Command line into guest memory.
     let mut cmdline = Cmdline::new(0x10000).context("allocating cmdline buf")?;
+    let full_cmdline = format!(
+        "{} virtio_mmio.device=4K@0x{:x}:{}",
+        args.cmdline, VIRTIO_BLK_BASE, 5
+    );
     cmdline
-        .insert_str(args.cmdline)
-        .context("writing cmdline to buf")?;
+        .insert_str(&full_cmdline)
+        .context("writing cmdline")?;
+
     load_cmdline(&guest_mem, GuestAddress(CMDLINE_START), &cmdline)
         .context("loading cmdline buf to guest memory")?;
 
@@ -363,6 +543,16 @@ fn main() -> Result<()> {
             VcpuExit::Shutdown => {
                 println!("\nguest shutdown");
                 break;
+            }
+            VcpuExit::MmioRead(addr, data) => {
+                if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_BLK_LEN).contains(&addr) {
+                    blk_dev.read(addr - VIRTIO_BLK_BASE, data);
+                }
+            }
+            VcpuExit::MmioWrite(addr, data) => {
+                if (VIRTIO_BLK_BASE..VIRTIO_BLK_BASE + VIRTIO_BLK_LEN).contains(&addr) {
+                    blk_dev.write(addr - VIRTIO_BLK_BASE, data);
+                }
             }
             other => {
                 println!("unhandled exit: {:?}", other);
